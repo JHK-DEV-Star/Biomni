@@ -1437,6 +1437,27 @@ Each library is listed with its description to help you understand its functiona
                 # Fallback to string conversion for legacy content
                 msg = str(content)
 
+            # ==========================================
+            # [수정 1] 무한 루프 감지 및 GPT-4o Fallback 추가
+            # ==========================================
+            loop_pattern = r"(<think>.*?</think>[\s\S]*?){3,}"
+            if re.search(loop_pattern, msg, re.IGNORECASE) or (len(msg) > 3000 and msg[:1000] == msg[1000:2000]):
+                print("🚨 무한 추론 루프(Thought Loop) 감지! GPT-4o를 호출하여 상황을 우회합니다.")
+                try:
+                    from langchain_core.messages import HumanMessage
+                    fallback_llm = get_llm(model="gpt-4o", source="OpenAI")
+                    fallback_prompt = (
+                        "System Alert: The previous model got stuck in an infinite loop. "
+                        "Stop repeating. Provide the correct, direct response to the user's latest query without using <think> tags. "
+                        "You MUST output EITHER <execute> python code here </execute> OR <solution> direct answer </solution>."
+                    )
+                    fallback_messages = state["messages"] + [HumanMessage(content=fallback_prompt)]
+                    fallback_response = fallback_llm.invoke(fallback_messages)
+                    msg = fallback_response.content
+                except Exception as e:
+                    print(f"Fallback failed: {e}")
+            # ==========================================
+            
             # Enhanced parsing for better OpenAI compatibility
             # Check for incomplete tags and fix them
             if "<execute>" in msg and "</execute>" not in msg:
@@ -1512,6 +1533,35 @@ Each library is listed with its description to help you understand its functiona
                 # 기존에 길었던 코드가 아래 한 줄로 깔끔해집니다.
                 # 이 함수가 실행되면서 Langfuse로 상세 실행 기록이 전송됩니다.
                 result = self._traced_run_code(code, timeout)
+
+                # ==========================================
+                # [수정 2] 데이터 로드/실행 에러 발생 시 GPT-4o 자동 디버깅
+                # ==========================================
+                if "Error:" in result or "Exception:" in result or "Traceback (most recent call last):" in result:
+                    print(f"🚨 코드 실행 에러 발생. GPT-4o로 자동 수정을 시도합니다...\n에러 요약: {result[-200:]}")
+                    try:
+                        from langchain_core.messages import HumanMessage
+                        fallback_llm = get_llm(model="gpt-4o", source="OpenAI")
+                        fix_prompt = f"""
+                        The following Python code resulted in an error during execution:
+                        ```python\n{code}\n```
+                        Error Output: {result}
+                        
+                        USER INTENT: The user is trying to process files from the data_lake or run a function.
+                        If the error is related to unsupported file formats (e.g., trying to read .parquet, .pkl, .json, or .xlsx as CSV), write Python code using pandas or appropriate libraries to safely read it into a DataFrame.
+                        Fix the error. Provide ONLY the fixed Python code enclosed in <execute> and </execute> tags. Do NOT add any other text.
+                        """
+                        fix_response = fallback_llm.invoke([HumanMessage(content=fix_prompt)])
+                        fixed_code_match = re.search(r"<execute>(.*?)</execute>", fix_response.content, re.DOTALL)
+                        
+                        if fixed_code_match:
+                            fixed_code = fixed_code_match.group(1).strip()
+                            print("💡 GPT-4o가 코드를 수정했습니다. 수정된 코드로 재실행합니다.")
+                            result = self._traced_run_code(fixed_code, timeout)
+                            result = f"[GPT-4o Auto-fixed Code Executed]\n" + result
+                    except Exception as e:
+                        print(f"GPT-4o 디버깅 Fallback 실패: {e}")
+                # ==========================================
 
                 if len(result) > 10000:
                     result = (
