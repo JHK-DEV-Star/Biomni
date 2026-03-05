@@ -1440,24 +1440,49 @@ For example: from [module_name] import [function_name]"""
                 msg = str(content)
 
             # ==========================================
-            # [수정 1] 무한 루프 감지 및 GPT-4o Fallback 추가
+            # [수정] 무한 루프 감지, 재실행 및 GPT-4o 컨텍스트 축약 Fallback
             # ==========================================
             loop_pattern = r"(<think>.*?</think>[\s\S]*?){3,}"
+            
+            # 이전 메시지가 루프 경고였는지 확인 (1차 재실행 여부 판단)
+            previous_was_loop_warning = any("System Alert: Infinite loop detected" in m.content for m in state["messages"][-2:])
+            
             if re.search(loop_pattern, msg, re.IGNORECASE) or (len(msg) > 3000 and msg[:1000] == msg[1000:2000]):
-                print("🚨 무한 추론 루프(Thought Loop) 감지! GPT-4o를 호출하여 상황을 우회합니다.")
-                try:
-                    from langchain_core.messages import HumanMessage
-                    fallback_llm = get_llm(model="gpt-4o", source="OpenAI")
-                    fallback_prompt = (
-                        "System Alert: The previous model got stuck in an infinite loop. "
-                        "Stop repeating. Provide the correct, direct response to the user's latest query without using <think> tags. "
-                        "You MUST output EITHER <execute> python code here </execute> OR <solution> direct answer </solution>."
-                    )
-                    fallback_messages = state["messages"] + [HumanMessage(content=fallback_prompt)]
-                    fallback_response = fallback_llm.invoke(fallback_messages)
-                    msg = fallback_response.content
-                except Exception as e:
-                    print(f"Fallback failed: {e}")
+                if not previous_was_loop_warning:
+                    print("🚨 무한 추론 루프(Thought Loop) 1차 감지! 현재 에이전트를 강제 종료하고 재실행을 유도합니다.")
+                    # 현재 응답을 자르고 경고 메시지를 추가하여 현재 모델이 스스로 고치도록 1차 유도
+                    state["messages"].append(AIMessage(content=msg[:500] + "\n... [LOOP TRUNCATED]"))
+                    state["messages"].append(HumanMessage(content="System Alert: Infinite loop detected. Stop repeating. Please evaluate your last step and provide a new, concise plan with a single <execute> or <solution> block."))
+                    state["next_step"] = "generate"
+                    return state
+                else:
+                    print("🚨 무한 추론 루프 2차 감지! 대화 기록을 축약하여 GPT-4o로 검증 및 Fallback을 시도합니다.")
+                    try:
+                        from langchain_core.messages import HumanMessage
+                        fallback_llm = get_llm(model="gpt-4o", source="OpenAI")
+                        fallback_prompt = (
+                            "System Alert: The primary agent got stuck in an infinite loop. "
+                            "Please review the system instructions, the original user request, and the last observation. "
+                            "Provide the correct next step. You MUST output EITHER <execute> python code here </execute> OR <solution> direct answer </solution>."
+                        )
+                        
+                        # [핵심] 중간 과정을 생략하고 축약된 컨텍스트만 구성
+                        sys_msg = SystemMessage(content=self.system_prompt)
+                        user_prompt = state["messages"][0] # 첫 사용자 질문
+                        # 직전 관찰 결과(Observation) 찾기 (가장 최근 Human/Tool/Observation 메시지)
+                        last_observation = state["messages"][-2] if len(state["messages"]) > 2 else state["messages"][0]
+                        
+                        fallback_messages = [
+                            sys_msg,
+                            user_prompt,
+                            last_observation,
+                            HumanMessage(content=fallback_prompt)
+                        ]
+                        
+                        fallback_response = fallback_llm.invoke(fallback_messages)
+                        msg = fallback_response.content
+                    except Exception as e:
+                        print(f"Fallback failed: {e}")
             # ==========================================
             
             # Enhanced parsing for better OpenAI compatibility
