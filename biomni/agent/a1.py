@@ -1252,12 +1252,14 @@ Each library is listed with its description to help you understand its functiona
             library_intro = (
                 "Based on your query, I've identified the following most relevant libraries that you can use:"
             )
-            import_instruction = "IMPORTANT: When using any function, you MUST first import it from its module. For example:\nfrom [module_name] import [function_name]"
+            import_instruction = """IMPORTANT: When using any function, you MUST first import it from its exact module as listed in the dictionary.
+DO NOT import functions from 'biomni_data'. 'biomni_data' is a directory for datasets, not a python module.
+For example: from [module_name] import [function_name]"""
         else:
             function_intro = "In your code, you will need to import the function location using the following dictionary of functions:"
             data_lake_intro = "You can write code to understand the data, process and utilize it for the task. Here is the list of datasets:"
             library_intro = "The environment supports a list of libraries that can be directly used. Do not forget the import statement:"
-            import_instruction = ""
+            import_instruction = """IMPORTANT: DO NOT import functions from 'biomni_data'. It is a local directory, not a python module."""
 
         # Format the content consistently for both initial and retrieval cases
         library_content_formatted = "\n".join(libraries_formatted)
