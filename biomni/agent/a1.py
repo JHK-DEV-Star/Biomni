@@ -1,5 +1,6 @@
 import glob
 import inspect
+import uuid
 import os
 import re
 from collections.abc import Generator
@@ -1839,13 +1840,17 @@ For example: from [module_name] import [function_name]"""
 
         return selected_resources_names
 
-    def go(self, prompt: str, callbacks: Callbacks = None):
+    def go(self, prompt: str, callbacks: Callbacks = None, session_id: str = None):
         """Execute the agent with the given prompt.
 
         Args:
             prompt: The user's query
 
         """
+        # session_id가 안 넘어올 경우를 대비해 고유 UUID 자동 생성
+        if session_id is None:
+            session_id = str(uuid.uuid4())
+
         self.critic_count = 0
         self.user_task = prompt
 
@@ -1854,7 +1859,7 @@ For example: from [module_name] import [function_name]"""
             self.update_system_prompt_with_selected_resources(selected_resources_names)
 
         inputs = {"messages": [HumanMessage(content=prompt)], "next_step": None}
-        config = {"recursion_limit": 500, "configurable": {"thread_id": 42}}
+        config = {"recursion_limit": 500, "configurable": {"thread_id": session_id}}
         if callbacks:
             config["callbacks"] = callbacks # LangGraph 스트림에 콜백 등록
         self.log = []
