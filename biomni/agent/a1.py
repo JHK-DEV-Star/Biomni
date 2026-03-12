@@ -55,6 +55,7 @@ if os.path.exists(".env"):
 class AgentState(TypedDict):
     messages: list[BaseMessage]
     next_step: str | None
+    tool_calls: list[dict] | None  # bind_tools 모드에서 사용
 
 
 class A1:
@@ -1305,16 +1306,25 @@ For example: from [module_name] import [function_name]"""
             self._inject_custom_functions_to_repl()
             return run_with_timeout(run_python_repl, [code], timeout=timeout)
 
-    def configure(self, self_critic=False, test_time_scale_round=0):
+    def configure(self, self_critic=False, test_time_scale_round=0,
+                  execution_mode="default", code_marker="execute"):
         """Configure the agent with the initial system prompt and workflow.
 
         Args:
             self_critic: Whether to enable self-critic mode
             test_time_scale_round: Number of rounds for test time scaling
+            execution_mode: "default" (기존 <execute> 방식) | "tool_select" (bind_tools 방식) | "native" (학습 후)
+            code_marker: "execute" (<execute> 텍스트 사용) | "wrap" ([EXECUTE] 시스템 래핑)
 
+        3가지 조합 (aigen_server가 모델에 따라 자동 선택):
+            api_execute:    execution_mode="tool_select", code_marker="execute"  — Cloud API 모델
+            wrap_execute:   execution_mode="tool_select", code_marker="wrap"     — 로컬 모델 학습 전
+            native_execute: execution_mode="native",      code_marker="execute"  — 로컬 모델 학습 후
         """
-        # Store self_critic for later use
+        # Store configuration for later use
         self.self_critic = self_critic
+        self.execution_mode = execution_mode
+        self.code_marker = code_marker
 
         # Get data lake content
         data_lake_path = self.path + "/data_lake"
@@ -2605,6 +2615,230 @@ For example: from [module_name] import [function_name]"""
             wrapper.__signature__ = inspect.Signature(new_params, return_annotation=dict)
 
             return wrapper
+
+    # ──────────────────────────────────────────────────────────────
+    # Phase 0 extensions: bind_tools, streaming, plan/step 분리
+    # 기존 go(), go_stream(), configure() 기본 동작은 변경하지 않음.
+    # ──────────────────────────────────────────────────────────────
+
+    @property
+    def _code_execution_tools(self) -> set[str]:
+        """코드 실행 도구 이름 집합"""
+        return {"code_gen", "execute_code", "run_analysis"}
+
+    def _get_bind_tools_schema(self):
+        """module2api + _custom_functions를 LangChain bind_tools 형식으로 변환"""
+        from langchain_core.tools import StructuredTool
+
+        tools = []
+        for _module_name, api_list in self.module2api.items():
+            for api in api_list:
+                if api["name"] == "run_python_repl":
+                    continue
+                func = self._custom_functions.get(api["name"])
+                if func:
+                    tool = StructuredTool.from_function(
+                        func=func,
+                        name=api["name"],
+                        description=api.get("description", ""),
+                    )
+                    tools.append(tool)
+        return tools
+
+    def _call_registered_tool(self, tool_name: str, args: dict):
+        """_custom_functions에 등록된 도구를 직접 호출"""
+        func = self._custom_functions.get(tool_name)
+        if func is None:
+            return {"error": f"Tool '{tool_name}' not found in registered functions"}
+        try:
+            return func(**args)
+        except Exception as e:
+            return {"error": str(e)}
+
+    @staticmethod
+    def _extract_execute_block(text: str) -> str | None:
+        """<execute>...</execute> 블록에서 코드 추출"""
+        match = re.search(r"<execute>(.*?)</execute>", text, re.DOTALL)
+        return match.group(1).strip() if match else None
+
+    @staticmethod
+    def _inject_execute_instructions(prompt: str) -> str:
+        """API 모델용: <execute> 사용법 안내를 시스템 프롬프트에 추가"""
+        instructions = (
+            "\n\nWhen you need to execute code, wrap it in <execute> tags:\n"
+            "<execute>\n# your code here\n</execute>\n"
+            "The system will execute the code and return the result in <observation> tags."
+        )
+        return prompt + instructions
+
+    @staticmethod
+    def _assemble_tool_calls(chunks: list) -> list[dict]:
+        """스트리밍 tool_call_chunks를 완전한 tool_calls 리스트로 조합"""
+        import json as _json
+
+        calls: dict[int, dict] = {}
+        for chunk in chunks:
+            idx = chunk.get("index", 0)
+            if idx not in calls:
+                calls[idx] = {"name": "", "args": ""}
+            if chunk.get("name"):
+                calls[idx]["name"] += chunk["name"]
+            if chunk.get("args"):
+                calls[idx]["args"] += chunk["args"]
+
+        result = []
+        for call in calls.values():
+            try:
+                call["args"] = _json.loads(call["args"]) if isinstance(call["args"], str) and call["args"] else {}
+            except _json.JSONDecodeError:
+                call["args"] = {}
+            result.append(call)
+        return result
+
+    async def astream_tokens(self, prompt: str, mode: str = "tool_select", callbacks=None):
+        """토큰 단위 async 스트리밍 — refusal 감지 가능
+
+        go_stream()은 step 단위이지만, 이 메서드는 토큰 단위.
+
+        Args:
+            prompt: 사용자 쿼리
+            mode: "plan_only" | "tool_select" | "agent" (도구 없는 대화)
+
+        Yields:
+            dict: {"type": "token", "content": "..."}
+                | {"type": "code_detected", "code": "...", "marker": "<execute>"|"[EXECUTE]"}
+                | {"type": "tool_call", "name": "...", "args": {...}}
+                | {"type": "tool_result", "result": "...", "wrapped_code": "..."}
+                | {"type": "done"}
+        """
+        code_marker = getattr(self, "code_marker", "execute")
+
+        # 모드별 LLM + 시스템 프롬프트 설정
+        if mode == "plan_only":
+            llm = self.llm
+            sys_prompt = getattr(self, "plan_prompt", self.execute_prompt)
+        elif mode == "tool_select":
+            tools_schema = self._get_bind_tools_schema()
+            llm = self.llm.bind_tools(tools_schema)
+            sys_prompt = self.execute_prompt
+            if code_marker == "execute":
+                sys_prompt = self._inject_execute_instructions(sys_prompt)
+        else:  # agent
+            llm = self.llm
+            sys_prompt = self.execute_prompt
+
+        messages = [SystemMessage(content=sys_prompt), HumanMessage(content=prompt)]
+
+        full_response = ""
+        tool_calls_buffer: list = []
+
+        async for chunk in llm.astream(messages):
+            # 텍스트 토큰
+            if chunk.content:
+                full_response += chunk.content
+                yield {"type": "token", "content": chunk.content}
+
+                # api_execute / native_execute: <execute> 텍스트 감지
+                if code_marker == "execute" and "</execute>" in full_response:
+                    code = self._extract_execute_block(full_response)
+                    if code is not None:
+                        yield {"type": "code_detected", "code": code, "marker": "<execute>"}
+
+            # wrap_execute: bind_tools tool_call_chunks
+            if hasattr(chunk, "tool_call_chunks") and chunk.tool_call_chunks:
+                tool_calls_buffer.extend(chunk.tool_call_chunks)
+
+        # 도구 호출이 있으면 실행
+        if tool_calls_buffer:
+            assembled = self._assemble_tool_calls(tool_calls_buffer)
+            for tc in assembled:
+                yield {"type": "tool_call", "name": tc["name"], "args": tc["args"]}
+
+                if tc["name"] in self._code_execution_tools:
+                    code = tc["args"].get("code", "")
+                    result = self._traced_run_code(code, self.timeout_seconds)
+                    if code_marker == "wrap":
+                        wrapped = f"[EXECUTE]\n{code}\n[/EXECUTE]"
+                    else:
+                        wrapped = f"<execute>\n{code}\n</execute>"
+                    yield {"type": "tool_result", "result": result, "wrapped_code": wrapped}
+                else:
+                    result = self._call_registered_tool(tc["name"], tc["args"])
+                    yield {"type": "tool_result", "result": result}
+
+        yield {"type": "done"}
+
+    def go_plan_only(self, prompt: str, callbacks=None):
+        """Plan만 생성하고 반환 (실행하지 않음)
+
+        Args:
+            prompt: 사용자 쿼리
+            callbacks: LangChain callbacks
+
+        Returns:
+            str: 생성된 plan 텍스트
+        """
+        sys_prompt = getattr(self, "plan_prompt", self.execute_prompt)
+        messages = [SystemMessage(content=sys_prompt), HumanMessage(content=prompt)]
+        config = {}
+        if callbacks:
+            config["callbacks"] = callbacks
+        response = self.llm.invoke(messages, config=config if config else None)
+        return response.content
+
+    async def astream_step(self, step_context: str, history: list[BaseMessage], callbacks=None):
+        """단일 step을 실행 — astream_tokens의 래퍼
+
+        Args:
+            step_context: 현재 실행할 step 설명
+            history: 이전 대화 히스토리 (LangChain messages)
+
+        Yields:
+            dict: astream_tokens와 동일한 이벤트 형식
+        """
+        code_marker = getattr(self, "code_marker", "execute")
+        tools_schema = self._get_bind_tools_schema()
+        llm = self.llm.bind_tools(tools_schema)
+
+        sys_prompt = self.execute_prompt
+        if code_marker == "execute":
+            sys_prompt = self._inject_execute_instructions(sys_prompt)
+
+        messages = [SystemMessage(content=sys_prompt)] + history + [HumanMessage(content=step_context)]
+
+        full_response = ""
+        tool_calls_buffer: list = []
+
+        async for chunk in llm.astream(messages):
+            if chunk.content:
+                full_response += chunk.content
+                yield {"type": "token", "content": chunk.content}
+
+                if code_marker == "execute" and "</execute>" in full_response:
+                    code = self._extract_execute_block(full_response)
+                    if code is not None:
+                        yield {"type": "code_detected", "code": code, "marker": "<execute>"}
+
+            if hasattr(chunk, "tool_call_chunks") and chunk.tool_call_chunks:
+                tool_calls_buffer.extend(chunk.tool_call_chunks)
+
+        if tool_calls_buffer:
+            assembled = self._assemble_tool_calls(tool_calls_buffer)
+            for tc in assembled:
+                yield {"type": "tool_call", "name": tc["name"], "args": tc["args"]}
+                if tc["name"] in self._code_execution_tools:
+                    code = tc["args"].get("code", "")
+                    result = self._traced_run_code(code, self.timeout_seconds)
+                    if code_marker == "wrap":
+                        wrapped = f"[EXECUTE]\n{code}\n[/EXECUTE]"
+                    else:
+                        wrapped = f"<execute>\n{code}\n</execute>"
+                    yield {"type": "tool_result", "result": result, "wrapped_code": wrapped}
+                else:
+                    result = self._call_registered_tool(tc["name"], tc["args"])
+                    yield {"type": "tool_result", "result": result}
+
+        yield {"type": "done"}
 
     def launch_gradio_demo(self, thread_id=42, share=False, server_name="0.0.0.0", require_verification=False):
         """Launch a full-featured Gradio UI for the A1 agent (adapted from codeact_copilot).
