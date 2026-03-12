@@ -13,6 +13,7 @@ ALLOWED_SOURCES: set[str] = set(SourceType.__args__)
 def get_llm(
     model: str | None = None,
     temperature: float | None = None,
+    max_tokens: int | None = None,
     stop_sequences: list[str] | None = None,
     source: SourceType | None = None,
     base_url: str | None = None,
@@ -136,6 +137,7 @@ def get_llm(
             return ChatOpenAI(
                 model=model,
                 temperature=temperature,
+                max_tokens=max_tokens,
                 stop_sequences=stop_sequences,
                 streaming=True,
             )
@@ -185,7 +187,7 @@ def get_llm(
         return ChatAnthropic(
             model=model,
             temperature=temperature,
-            max_tokens=8192,
+            max_tokens=max_tokens or 8192,
             stop_sequences=stop_sequences,
         )
 
@@ -263,7 +265,7 @@ def get_llm(
         llm = ChatOpenAI(
             model=model,
             temperature=temperature,
-            max_tokens=8192,
+            max_tokens=max_tokens or 8192,
             stop_sequences=stop_sequences,
             base_url=base_url,
             api_key=api_key,
