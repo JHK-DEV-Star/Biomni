@@ -35,7 +35,7 @@ def get_llm(
     # Use config values for any unspecified parameters
     if config is not None:
         if model is None:
-            model = config.llm_model
+            model = config.llm
         if temperature is None:
             temperature = config.temperature
         if source is None:
@@ -137,6 +137,7 @@ def get_llm(
                 model=model,
                 temperature=temperature,
                 stop_sequences=stop_sequences,
+                streaming=True,
             )
 
     elif source == "AzureOpenAI":
@@ -266,6 +267,7 @@ def get_llm(
             stop_sequences=stop_sequences,
             base_url=base_url,
             api_key=api_key,
+            streaming=True,
         )
         return llm
 
